@@ -1,0 +1,15 @@
+.DS_Store
+node_modules/
+
+# Playwright
+playwright-report/
+test-results/
+.pw-browsers/
+pw-summary/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+

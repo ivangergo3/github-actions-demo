@@ -1,0 +1,290 @@
+name: Playwright (parallel specs)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+jobs:
+  discover:
+    name: discover specs
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - id: set-matrix
+        name: Build matrix from tests folder
+        shell: bash
+        run: |
+          shopt -s nullglob
+
+          files=(tests/*.spec.ts)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No *.spec.ts files found in ./tests" >&2
+            exit 1
+          fi
+
+          mapfile -t files_sorted < <(printf '%s\n' "${files[@]}" | sort)
+
+          include=""
+          for spec in "${files_sorted[@]}"; do
+            base="$(basename "$spec")"
+            id="${base%.spec.ts}"
+            id="$(echo "$id" | tr -cs 'A-Za-z0-9_-' '-' | sed 's/^-*//; s/-*$//')"
+            include="${include}{\"id\":\"$id\",\"spec\":\"$spec\"},"
+          done
+
+          MATRIX="{\"include\":[${include%,}]}"
+
+          echo "matrix<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+  e2e:
+    name: e2e (${{ matrix.id }})
+    runs-on: ubuntu-latest
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: .pw-browsers
+          key: pw-browsers-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright browsers
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run spec
+        env:
+          CI: true
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
+        run: npx playwright test ${{ matrix.spec }}
+
+      - name: Build JSON summary (bash + jq)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p pw-summary
+
+          if [ ! -f "playwright-report/results.json" ]; then
+            jq -n \
+              --arg id "${{ matrix.id }}" \
+              --arg spec "${{ matrix.spec }}" \
+              --arg error "missing playwright-report/results.json" \
+              '{
+                id: $id,
+                spec: $spec,
+                passed: 0,
+                failed: 0,
+                skipped: 0,
+                flaky: 0,
+                error: $error,
+                generatedAt: (now | todateiso8601)
+              }' > "pw-summary/${{ matrix.id }}.json"
+            exit 0
+          fi
+
+          # We only run 1 spec per job, so results.json should contain just that spec.
+          # Still, we compute counts from the JSON reporter output deterministically.
+          jq -n \
+            --arg id "${{ matrix.id }}" \
+            --arg spec "${{ matrix.spec }}" \
+            --slurpfile r "playwright-report/results.json" '
+              def all_tests:
+                [ $r[0]
+                  | .. | objects
+                  | select(has("expectedStatus") and has("status") and has("results"))
+                ];
+
+              def count_status($s):
+                (all_tests | map(select(.status == $s)) | length);
+
+              {
+                id: $id,
+                spec: $spec,
+                passed: count_status("expected"),
+                failed: count_status("unexpected"),
+                skipped: count_status("skipped"),
+                flaky: count_status("flaky"),
+                error: null,
+                generatedAt: (now | todateiso8601)
+              }
+            ' > "pw-summary/${{ matrix.id }}.json"
+
+      - name: Upload HTML report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.id }}
+          path: playwright-report
+          retention-days: 7
+
+      - name: Upload summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-summary-${{ matrix.id }}
+          path: pw-summary/${{ matrix.id }}.json
+          retention-days: 7
+
+  aggregate:
+    name: aggregate results
+    runs-on: ubuntu-latest
+    needs: [discover, e2e]
+    if: always()
+    steps:
+      - name: Download all summary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: playwright-summary-*
+          path: pw-summary
+          merge-multiple: true
+
+      - name: Aggregate into one summary (bash + jq)
+        shell: bash
+        run: |
+          ls -la pw-summary || true
+
+          # Ensure we have one summary JSON per expected matrix entry.
+          matrix='${{ needs.discover.outputs.matrix }}'
+          echo "$matrix" | jq -r '.include[] | [.id, .spec] | @tsv' | while IFS=$'\t' read -r id spec; do
+            if [ ! -f "pw-summary/${id}.json" ]; then
+              jq -n \
+                --arg id "$id" \
+                --arg spec "$spec" \
+                --arg error "missing summary artifact (job likely failed before producing it)" \
+                '{
+                  id: $id,
+                  spec: $spec,
+                  passed: 0,
+                  failed: 0,
+                  skipped: 0,
+                  flaky: 0,
+                  error: $error,
+                  generatedAt: (now | todateiso8601)
+                }' > "pw-summary/${id}.json"
+            fi
+          done
+
+          jq -s '
+            {
+              generatedAt: (now | todateiso8601),
+              specs: sort_by(.id),
+              totals: {
+                passed: (map(.passed) | add),
+                failed: (map(.failed) | add),
+                skipped: (map(.skipped) | add),
+                flaky: (map(.flaky) | add)
+              }
+            }
+          ' pw-summary/*.json > pw-summary/aggregate.json
+
+          jq -r '
+            "## Playwright summary\n"
+            + ("- Total: **" + ((.totals.passed + .totals.failed + .totals.skipped + .totals.flaky) | tostring) + "**  "
+              + "Passed: **" + (.totals.passed|tostring) + "**  "
+              + "Failed: **" + (.totals.failed|tostring) + "**  "
+              + "Skipped: **" + (.totals.skipped|tostring) + "**  "
+              + "Flaky: **" + (.totals.flaky|tostring) + "**\n\n")
+            + "### Per spec\n"
+            + ( .specs
+                | map(
+                    "- `" + .spec + "` — Passed: " + (.passed|tostring)
+                    + ", Failed: " + (.failed|tostring)
+                    + ", Skipped: " + (.skipped|tostring)
+                    + (if .error then " _(error: " + .error + ")_" else "" end)
+                  )
+                | join("\n")
+              )
+            + "\n"
+          ' pw-summary/aggregate.json > pw-summary/aggregate.md
+
+      - name: Build PR comment body (with artifact links)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" > pw-summary/artifacts.json
+
+          {
+            echo "<!-- playwright-summary-comment -->"
+            echo
+            cat pw-summary/aggregate.md
+            echo
+            echo "### Reports (artifacts)"
+            echo
+            echo "- Run page: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            jq -r '
+              .artifacts
+              | map(select(.name | startswith("playwright-report-")) | "- [" + .name + "](" + .archive_download_url + ")")
+              | sort
+              | .[]
+            ' pw-summary/artifacts.json
+            echo
+          } > pw-summary/comment.md
+
+      - name: Post or update PR comment
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pr_number="${{ github.event.pull_request.number }}"
+
+          existing_id="$(gh api "/repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments?per_page=100" \
+            | jq -r 'map(select(.body | contains("<!-- playwright-summary-comment -->"))) | first | .id // empty')"
+
+          if [ -n "$existing_id" ]; then
+            gh api -X PATCH "/repos/${GITHUB_REPOSITORY}/issues/comments/${existing_id}" \
+              -f body="$(cat pw-summary/comment.md)" >/dev/null
+            echo "Updated existing PR comment (${existing_id})."
+          else
+            gh api -X POST "/repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments" \
+              -f body="$(cat pw-summary/comment.md)" >/dev/null
+            echo "Created new PR comment."
+          fi
+
+      - name: Upload aggregate artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-aggregate
+          path: pw-summary/aggregate.*
+          retention-days: 7
+
+      - name: Fail workflow if any spec failed
+        shell: bash
+        run: |
+          failed="$(jq -r '.totals.failed' pw-summary/aggregate.json)"
+          if [ "$failed" -gt 0 ]; then
+            echo "One or more specs failed (failed=$failed)."
+            exit 1
+          fi
+
