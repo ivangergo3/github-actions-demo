@@ -234,7 +234,6 @@ jobs:
         run: |
           gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" > pw-summary/artifacts.json
           run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          artifacts_url="${run_url}#artifacts"
 
           {
             echo "<!-- playwright-summary-comment -->"
@@ -244,12 +243,11 @@ jobs:
             echo "### Reports (artifacts)"
             echo
             echo "- Run page: ${run_url}"
-            echo "- Artifacts: ${artifacts_url}"
             echo
             jq -r '
               .artifacts
               | map(select(.name | startswith("playwright-report-")) | "- **" + .name + "** — " +
-                  "[view in UI](https://github.com/'"${GITHUB_REPOSITORY}"'/actions/runs/'"${GITHUB_RUN_ID}"'/artifacts/" + (.id|tostring) + ") (or download from the run’s [Artifacts]('"${artifacts_url}"'))"
+                  "[Download](https://github.com/'"${GITHUB_REPOSITORY}"'/actions/runs/'"${GITHUB_RUN_ID}"'/artifacts/" + (.id|tostring) + ")"
                 )
               | sort
               | .[]
