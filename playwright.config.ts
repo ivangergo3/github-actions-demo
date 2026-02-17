@@ -1,25 +1,25 @@
-import { defineConfig } from '@playwright/test';
+import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
-  testDir: './tests',
+  testDir: "./tests",
   timeout: 30_000,
+  workers: process.env.GITHUB_ACTIONS ? 1 : undefined,
   expect: {
     timeout: 5_000,
   },
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   reporter: [
-    ['html', { open: 'never' }],
-    ['json', { outputFile: 'playwright-report/results.json' }],
+    ["html", { open: "never" }],
+    ["json", { outputFile: "playwright-report/results.json" }],
   ],
   use: {
-    trace: 'on-first-retry',
+    trace: "on-first-retry",
   },
   projects: [
     {
-      name: 'chromium',
-      use: { browserName: 'chromium' },
+      name: "chromium",
+      use: { browserName: "chromium" },
     },
   ],
 });
-
