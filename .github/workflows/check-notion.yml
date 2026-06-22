@@ -1,0 +1,49 @@
+name: Check Notion Availability
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * MON-FRI"
+
+jobs:
+  check:
+    name: Check https://www.notion.com
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify HTTPS connection and availability
+        run: |
+          RESPONSE=$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out "%{http_code} %{url_effective} %{ssl_verify_result}" \
+            --location \
+            --max-time 15 \
+            "https://www.notion.com/")
+
+          HTTP_CODE=$(echo "$RESPONSE" | awk '{print $1}')
+          FINAL_URL=$(echo "$RESPONSE" | awk '{print $2}')
+          SSL_RESULT=$(echo "$RESPONSE" | awk '{print $3}')
+
+          echo "HTTP status : $HTTP_CODE"
+          echo "Final URL   : $FINAL_URL"
+          echo "SSL verify  : $SSL_RESULT (0 = OK)"
+
+          # Must respond with 2xx
+          if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
+            echo "FAIL: unexpected HTTP status $HTTP_CODE"
+            exit 1
+          fi
+
+          # Final URL (after redirects) must still be HTTPS
+          if [[ "$FINAL_URL" != https://* ]]; then
+            echo "FAIL: final URL is not HTTPS — got $FINAL_URL"
+            exit 1
+          fi
+
+          # SSL certificate must be valid (curl ssl_verify_result 0 = success)
+          if [[ "$SSL_RESULT" != "0" ]]; then
+            echo "FAIL: SSL certificate verification failed (code $SSL_RESULT)"
+            exit 1
+          fi
+
+          echo "OK: notion.com is reachable over HTTPS with a valid certificate."
